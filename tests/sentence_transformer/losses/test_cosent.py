@@ -8,6 +8,7 @@ import torch
 
 from sentence_transformers.sentence_transformer.losses import AnglELoss, CoSENTLoss
 from sentence_transformers.sparse_encoder.losses import SparseAnglELoss, SparseCoSENTLoss
+from tests.utils import skip_bfloat16_cpu_crash
 
 
 @pytest.fixture
@@ -50,8 +51,7 @@ def test_angle_loss_ranks_actual_angle_scores(dummy_model, labels, score_differe
     assert value.item() == pytest.approx(math.log1p(math.exp(2.0 * score_difference)), abs=1e-5)
 
 
-def _explicit_cosent_loss(loss_fn, embeddings, labels):
-    scores = loss_fn.similarity_fct(*embeddings) * loss_fn.scale
+def _explicit_cosent_loss_from_scores(scores, labels):
     terms = [scores.new_zeros(())]
     for low in range(len(labels)):
         for high in range(len(labels)):
@@ -59,6 +59,11 @@ def _explicit_cosent_loss(loss_fn, embeddings, labels):
                 terms.append(scores[low] - scores[high])
     # Preserve the gradient connection even when there are no ordered pairs.
     return torch.logsumexp(torch.stack(terms), dim=0) + scores.sum() * 0
+
+
+def _explicit_cosent_loss(loss_fn, embeddings, labels):
+    scores = loss_fn.similarity_fct(*embeddings) * loss_fn.scale
+    return _explicit_cosent_loss_from_scores(scores, labels)
 
 
 @pytest.mark.parametrize("loss_class", [CoSENTLoss, AnglELoss, SparseCoSENTLoss, SparseAnglELoss])
@@ -159,6 +164,81 @@ def test_cosent_low_precision_scores_use_float32_reduction(dummy_model, dtype):
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(embeddings[0].grad.float(), reference_embeddings[0].grad, rtol=5e-3, atol=2e-3)
+
+
+@skip_bfloat16_cpu_crash
+def test_cosent_scales_low_precision_scores_in_float32(word_embeddings_model):
+    from sentence_transformers.sentence_transformer.modules import Dense
+
+    model = word_embeddings_model.to("cpu")
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(7)
+        model.append(Dense(model.get_embedding_dimension(), 32, activation_function=torch.nn.Tanh()))
+
+    left_texts = [
+        "hello world",
+        "sentence transformers",
+        "embedding model",
+        "text vector",
+        "hello sentence",
+        "world model",
+        "transformers vector",
+        "embedding text",
+    ]
+    right_texts = [
+        "sentence model",
+        "hello vector",
+        "world text",
+        "transformers embedding",
+        "vector model",
+        "sentence text",
+        "hello embedding",
+        "world transformers",
+    ]
+    labels = torch.arange(len(left_texts), dtype=torch.float32)
+    loss_fn = CoSENTLoss(model, similarity_fct=lambda a, b: (a * b).sum(-1))
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        embeddings = [model(model.preprocess(texts))["sentence_embedding"] for texts in (left_texts, right_texts)]
+        assert all(embedding.dtype == torch.bfloat16 for embedding in embeddings)
+
+        scores = loss_fn.similarity_fct(*embeddings)
+        assert scores.dtype == torch.bfloat16
+        actual = loss_fn.compute_loss_from_embeddings(embeddings, labels)
+        expected = _explicit_cosent_loss_from_scores(scores.float() * loss_fn.scale, labels)
+
+    assert actual.dtype == torch.float32
+    assert torch.isfinite(actual)
+    actual.backward(retain_graph=True)
+    actual_grad = model[-1].linear.weight.grad.detach().clone()
+    assert torch.isfinite(actual_grad).all()
+
+    model.zero_grad(set_to_none=True)
+    expected.backward()
+    expected_grad = model[-1].linear.weight.grad
+    assert torch.isfinite(expected_grad).all()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_grad, expected_grad)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cosent_default_scale_matches_float32_score_reference(word_embeddings_model, dtype):
+    embeddings = [
+        torch.tensor([[0.123], [-0.234], [0.876], [-0.654]], dtype=dtype).requires_grad_(),
+        torch.ones(4, 1, dtype=dtype),
+    ]
+    labels = torch.tensor([0, 1, 0, 1])
+    loss_fn = CoSENTLoss(word_embeddings_model, similarity_fct=lambda a, b: (a * b).sum(-1))
+    scores = loss_fn.similarity_fct(*embeddings)
+
+    actual = loss_fn.compute_loss_from_embeddings(embeddings, labels)
+    expected = _explicit_cosent_loss_from_scores(scores.float() * loss_fn.scale, labels)
+
+    torch.testing.assert_close(actual, expected)
+    actual_grad = torch.autograd.grad(actual, embeddings[0], retain_graph=True)[0]
+    expected_grad = torch.autograd.grad(expected, embeddings[0])[0]
+    assert torch.isfinite(actual_grad).all()
+    torch.testing.assert_close(actual_grad, expected_grad)
 
 
 def test_cosent_large_scale_has_finite_loss_and_gradients(dummy_model):
