@@ -39,7 +39,7 @@ class EmbeddingSimilarityEvaluator(BaseEvaluator):
         main_similarity (Optional[Union[str, SimilarityFunction]], optional): The main similarity function to use.
             Can be a string (e.g. "cosine", "dot") or a SimilarityFunction object. Defaults to None.
         similarity_fn_names (List[str], optional): List of similarity function names to use. If None, the
-            ``similarity_fn_name`` attribute of the model is used. Defaults to None.
+            ``similarity_fn_name`` attribute of the model passed to each evaluation call is used. Defaults to None.
         name (str, optional): The name of the evaluator. Defaults to "".
         show_progress_bar (bool, optional): Whether to show a progress bar during evaluation. Defaults to False.
         write_csv (bool, optional): Whether to write the evaluation results to a CSV file. Defaults to True.
@@ -106,6 +106,7 @@ class EmbeddingSimilarityEvaluator(BaseEvaluator):
 
         self.main_similarity = SimilarityFunction(main_similarity) if main_similarity else None
         self.similarity_fn_names = similarity_fn_names or []
+        self._similarity_fn_names_from_model = not self.similarity_fn_names and self.main_similarity is None
         if self.similarity_fn_names == [] and self.main_similarity is not None:
             self.similarity_fn_names = [self.main_similarity.value]
 
@@ -137,6 +138,32 @@ class EmbeddingSimilarityEvaluator(BaseEvaluator):
         for v in similarity_fn_names:
             for m in metrics:
                 self.csv_headers.append(f"{v}_{m}")
+
+    def _csv_file_for_model_similarity(self, similarity_fn_name: str, output_path: str) -> str:
+        if self.csv_file.endswith("_results.csv"):
+            base_stem = self.csv_file.removesuffix("_results.csv")
+            similarity_csv_file = f"{base_stem}_{similarity_fn_name}_results.csv"
+        else:
+            base_stem, extension = os.path.splitext(self.csv_file)
+            similarity_csv_file = f"{base_stem}_{similarity_fn_name}{extension}"
+
+        candidates = [self.csv_file, similarity_csv_file]
+        for csv_file in candidates:
+            csv_path = os.path.join(output_path, csv_file)
+            if not os.path.isfile(csv_path):
+                return csv_file
+            try:
+                with open(csv_path, newline="", encoding="utf-8") as file:
+                    existing_headers = next(csv.reader(file), [])
+            except (csv.Error, UnicodeDecodeError):
+                continue
+            if existing_headers == self.csv_headers:
+                return csv_file
+
+        raise ValueError(
+            f"Cannot write {similarity_fn_name} evaluation results: neither {candidates[0]!r} nor "
+            f"{candidates[1]!r} has the expected CSV headers {self.csv_headers}."
+        )
 
     @classmethod
     def from_input_examples(cls, examples: list[InputExample], **kwargs):
@@ -182,8 +209,9 @@ class EmbeddingSimilarityEvaluator(BaseEvaluator):
 
         labels = self.scores
 
-        if not self.similarity_fn_names:
+        if self._similarity_fn_names_from_model:
             self.similarity_fn_names = [model.similarity_fn_name]
+            self.csv_headers = ["epoch", "steps"]
             self._append_csv_headers(self.similarity_fn_names)
 
         similarity_functions = {
@@ -207,7 +235,10 @@ class EmbeddingSimilarityEvaluator(BaseEvaluator):
 
         if output_path is not None and self.write_csv:
             os.makedirs(output_path, exist_ok=True)
-            csv_path = os.path.join(output_path, self.csv_file)
+            csv_file = self.csv_file
+            if self._similarity_fn_names_from_model:
+                csv_file = self._csv_file_for_model_similarity(self.similarity_fn_names[0], output_path)
+            csv_path = os.path.join(output_path, csv_file)
             output_file_exists = os.path.isfile(csv_path)
             with open(csv_path, newline="", mode="a" if output_file_exists else "w", encoding="utf-8") as f:
                 writer = csv.writer(f)
